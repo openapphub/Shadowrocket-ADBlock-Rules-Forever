@@ -1,12 +1,10 @@
 name: CI/CD and Maintenance
 
 on:
-  # 定时任务：每天分两个时段执行 (01:30 处理 Issue, 23:00 构建发布)
   schedule:
     - cron: "30 1 * * *"
     - cron: "0 23 * * *"
 
-  # 代码推送时触发构建
   push:
     branches:
       - build
@@ -14,7 +12,6 @@ on:
       - '**.md'
       - 'LICENSE'
 
-  # PR 目标为 build 分支时触发
   pull_request_target:
     branches:
       - build
@@ -22,11 +19,9 @@ on:
       - '**.md'
       - 'LICENSE'
 
-  # 允许手动触发
   workflow_dispatch:
 
 jobs:
-  # 任务 1: 关闭不活跃的 Issues
   close-issues:
     name: Close Inactive Issues
     runs-on: ubuntu-latest
@@ -46,7 +41,6 @@ jobs:
           days-before-pr-close: -1
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-  # 任务 2: 构建规则并发布
   build-and-release:
     name: Build and Release Rules
     runs-on: ubuntu-latest
@@ -57,7 +51,6 @@ jobs:
       - name: Checkout Build Branch
         uses: actions/checkout@v4
         with:
-          # 确保获取所有历史和分支，防止找不到 build 分支
           fetch-depth: 0 
           ref: build
           path: build
@@ -69,37 +62,39 @@ jobs:
           ref: release
           path: release
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install requirements
-        run: pip3 install -r build/requirements.txt
-
       - name: Build Rules
         run: |
           cd build || exit 1
+          chmod +x factory/auto_build.sh
           ./factory/auto_build.sh
     
-      - name: Move files
+      # 准备发布文件
+      - name: Prepare Release Files
         run: |
           cd build || exit 1
-          cp *.conf ../release/
-          cp -r figure ../release/
-          cp LICENSE ../release/
-          cp readme.md ../release/
+          
+          # 仅复制必要的 .conf 文件到发布目录
+          # 这一步确保只有 .conf 文件会被处理
+          if ls *.conf 1> /dev/null 2>&1; then
+            cp *.conf ../release/
+          else
+            echo "Warning: No .conf files found in build directory!"
+          fi
+          
+          # 可选：如果你需要 figure、LICENSE 或 readme，取消下面注释
+          # cp -r figure ../release/ 2>/dev/null || true
+          # cp LICENSE ../release/ 2>/dev/null || true
+          # cp readme.md ../release/ 2>/dev/null || true
     
       - name: Update lazy rules
         run: |
           cd release || exit 1
           rm -f lazy.conf lazy_group.conf
-          curl -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf
-          curl -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf
+          curl -fLo lazy.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf || echo "Failed to download lazy.conf"
+          curl -fLo lazy_group.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf || echo "Failed to download lazy_group.conf"
     
       - name: Commit and Push to Release Branch
         run: |
-          # 设置 Git 安全目录，避免权限错误
           git config --global --add safe.directory /github/workspace/build
           git config --global --add safe.directory /github/workspace/release
 
@@ -107,10 +102,9 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # 如果 release 分支不存在，初始化它
+          # 检查 release 分支是否存在
           if ! git show-ref --verify --quiet refs/heads/release; then
              echo "Release branch not found, initializing..."
-             # 如果是空目录，需要先提交一次
              if [ -z "$(git ls-files)" ]; then
                git checkout --orphan release
                git commit --allow-empty -m "Init release branch"
@@ -124,23 +118,31 @@ jobs:
              git checkout release
           fi
           
-          # 这里我们不使用 --orphan，而是直接在现有分支上强制更新
-          # 这样可以保留 Git 历史，除非你确实想要一个全新的历史记录
+          # 清理工作目录
           git rm -rf . || true
-          cp -r ../build/* ./
           
-          # 再次更新 lazy 规则 (确保覆盖)
+          # 再次复制并确保只有 .conf 和特定文件存在
+          cd ../build
+          cp *.conf ../release/ 2>/dev/null || true
+          cd ../release
+          
+          # 重新获取 lazy 规则
           rm -f lazy.conf lazy_group.conf
-          curl -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf
-          curl -O https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf
+          curl -fLo lazy.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy.conf || true
+          curl -fLo lazy_group.conf https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf || true
 
+          # 添加所有变更
           git add -A
-          git commit -am "Nightly build @ $(date +'%Y-%m-%d %H:%M:%S')"
           
-          # 强制推送到远程 release 分支
-          git push -f origin release
+          # 检查是否有变更
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -am "Nightly build @ $(date +'%Y-%m-%d %H:%M:%S')"
+            git push -f origin release
+          fi
 
-      - name: Create GitHub Release (Auto Publish)
+      - name: Create GitHub Release
         if: github.event_name == 'schedule'
         uses: softprops/action-gh-release@v1
         with:
@@ -151,9 +153,10 @@ jobs:
             **Changes:**
             - Updated rules from build branch.
             - Synced lazy rules.
-          files: |
-            release/*.conf
+          # 严格匹配 release 目录下的 .conf 文件
+          files: release/*.conf
           prerelease: true
-          fail_on_unmatched_files: true
+          # 如果文件找不到会导致失败，调试阶段可以先设为 false
+          fail_on_unmatched_files: true 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
